@@ -1159,14 +1159,26 @@ class APIKeyMiddleware:
 
     async def __call__(self, scope, receive, send):
         import secrets
+        from urllib.parse import parse_qs
 
         if scope["type"] == "http":
+            path = scope.get("path", "")
+
+            # Laisse passer la découverte OAuth de Claude (réponse 404 = pas d'OAuth)
+            if path.startswith("/.well-known/"):
+                await self.app(scope, receive, send)
+                return
+
             keys = [
                 value
                 for name, value in scope.get("headers", [])
                 if name.lower() == b"x-mcp-key"
             ]
 
+            # Les connecteurs Claude.ai ne peuvent pas envoyer d'en-tête : clé acceptée via ?key=
+            if not keys:
+                query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+                keys = [value.encode("utf-8") for value in query.get("key", [])]
             if (
                 len(keys) != 1
                 or not secrets.compare_digest(
