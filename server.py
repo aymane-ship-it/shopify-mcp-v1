@@ -3,7 +3,7 @@
 Shopify MCP Server.
 
 Tools: products, orders, customers, collections, shop, themes and pages.
-Remote access protected by the X-MCP-Key request header.
+Remote access protected by the Authorization (Bearer) or X-MCP-Key header.
 Secrets are read from Railway environment variables.
 """
 
@@ -1145,7 +1145,13 @@ async def shopify_delete_page(
 # ---------------------------------------------------------------------
 
 class APIKeyMiddleware:
-    """Protect HTTP requests and forward lifecycle events unchanged."""
+    """Protect HTTP requests and forward lifecycle events unchanged.
+
+    Accepted credentials (one of them):
+    - Authorization: Bearer <MCP_API_KEY>   (Claude.ai connectors)
+    - X-MCP-Key: <MCP_API_KEY>              (other clients)
+    The key is never accepted in the URL.
+    """
 
     def __init__(self, app, api_key):
         if len(api_key) < 32:
@@ -1157,37 +1163,39 @@ class APIKeyMiddleware:
         self.app = app
         self.expected_key = api_key.encode("utf-8")
 
+    def _extract_key(self, headers):
+        for name, value in headers:
+            name = name.lower()
+
+            if name == b"authorization":
+                value = value.strip()
+                # Accept "Bearer <key>" or the bare key
+                if value[:7].lower() == b"bearer ":
+                    value = value[7:].strip()
+                return value
+
+            if name == b"x-mcp-key":
+                return value.strip()
+
+        return None
+
     async def __call__(self, scope, receive, send):
         import secrets
-        from urllib.parse import parse_qs
 
         if scope["type"] == "http":
             path = scope.get("path", "")
 
-            # Laisse passer la découverte OAuth de Claude (réponse 404 = pas d'OAuth)
+            # Claude OAuth discovery: a 404 means "no OAuth"
             if path.startswith("/.well-known/"):
                 await self.app(scope, receive, send)
                 return
 
-            keys = [
-                value
-                for name, value in scope.get("headers", [])
-                if name.lower() == b"x-mcp-key"
-            ]
+            key = self._extract_key(scope.get("headers", []))
 
-            # Les connecteurs Claude.ai ne peuvent pas envoyer d'en-tête : clé acceptée via ?key=
-            if not keys:
-                query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
-                keys = [value.encode("utf-8") for value in query.get("key", [])]
-            if (
-                len(keys) != 1
-                or not secrets.compare_digest(
-                    keys[0],
-                    self.expected_key,
-                )
+            if key is None or not secrets.compare_digest(
+                key,
+                self.expected_key,
             ):
-                body = b'{"error":"Unauthorized"}'
-
                 await send({
                     "type": "http.response.start",
                     "status": 401,
@@ -1199,7 +1207,7 @@ class APIKeyMiddleware:
 
                 await send({
                     "type": "http.response.body",
-                    "body": body,
+                    "body": b'{"error":"Unauthorized"}',
                 })
 
                 return
